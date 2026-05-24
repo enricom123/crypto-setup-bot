@@ -6,13 +6,17 @@ from datetime import datetime, timezone
 import schedule
 import time
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+
+alerted = set()
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -45,12 +49,10 @@ def get_ema(series, period):
 
 def get_daily_bias(symbol):
     df = get_klines(symbol, "1d", limit=60)
-    if df is None or len(df) < 52:
+    if df is None or len(df) < 10:
         return None
-    ema200 = get_ema(df["close"], 200)
-    # Con 60 candele non abbiamo EMA200 stabile, usiamo EMA50 daily come proxy
     ema50 = get_ema(df["close"], 50)
-    last_close = df["close"].iloc[-2]  # candela chiusa, non quella corrente
+    last_close = df["close"].iloc[-2]
     if last_close > ema50.iloc[-2]:
         return "LONG"
     elif last_close < ema50.iloc[-2]:
@@ -61,157 +63,116 @@ def get_weekly_levels(symbol):
     df = get_klines(symbol, "1w", limit=10)
     if df is None or len(df) < 2:
         return None, None
-    prev_week = df.iloc[-2]
-    return float(prev_week["high"]), float(prev_week["low"])
+    prev = df.iloc[-2]
+    return float(prev["high"]), float(prev["low"])
 
 def get_daily_levels(symbol):
     df = get_klines(symbol, "1d", limit=10)
     if df is None or len(df) < 2:
         return None, None
-    prev_day = df.iloc[-2]
-    return float(prev_day["high"]), float(prev_day["low"])
+    prev = df.iloc[-2]
+    return float(prev["high"]), float(prev["low"])
 
-def has_fvg(df, index, direction):
-    if index < 2:
-        return False
-    c1 = df.iloc[index - 2]
-    c3 = df.iloc[index]
-    if direction == "LONG":
-        return c3["low"] > c1["high"]
-    elif direction == "SHORT":
-        return c3["high"] < c1["low"]
-    return False
+def build_market_context(symbol, bias, pwh, pwl, pdh, pdl):
+    df_1h = get_klines(symbol, "1h", limit=50)
+    df_4h = get_klines(symbol, "4h", limit=50)
+    df_15m = get_klines(symbol, "15m", limit=50)
 
-def check_breakout(symbol, tf_high, bias, pwh, pwl, pdh, pdl):
-    df = get_klines(symbol, tf_high, limit=50)
-    if df is None or len(df) < 10:
+    if df_1h is None or df_4h is None or df_15m is None:
         return None
 
-    levels = {
-        "PWH": pwh, "PWL": pwl,
-        "PDH": pdh, "PDL": pdl
-    }
+    def candles_to_text(df, label, n=10):
+        rows = []
+        for _, row in df.tail(n).iterrows():
+            body = abs(row["close"] - row["open"])
+            rng = row["high"] - row["low"]
+            body_pct = round(body / rng * 100, 1) if rng > 0 else 0
+            direction = "BULL" if row["close"] > row["open"] else "BEAR"
+            rows.append(
+                f"{row['open_time'].strftime('%m-%d %H:%M')} | {direction} | "
+                f"O:{row['open']:.1f} H:{row['high']:.1f} L:{row['low']:.1f} C:{row['close']:.1f} | "
+                f"Body:{body_pct}%"
+            )
+        return f"\n[{label}]\n" + "\n".join(rows)
 
-    for i in range(len(df) - 4, len(df) - 1):
-        candle = df.iloc[i]
-        body = abs(candle["close"] - candle["open"])
-        candle_range = candle["high"] - candle["low"]
-        if candle_range == 0:
-            continue
-        body_ratio = body / candle_range
+    current_price = df_15m["close"].iloc[-1]
 
-        if body_ratio < 0.6:
-            continue
+    context = f"""SYMBOL: {symbol}
+CURRENT PRICE: {current_price:.2f}
+DAILY BIAS: {bias}
+KEY LEVELS:
+  PWH: {pwh:.2f} | PWL: {pwl:.2f}
+  PDH: {pdh:.2f} | PDL: {pdl:.2f}
 
-        broken_level = None
-        broken_value = None
+RECENT CANDLES:
+{candles_to_text(df_4h, '4H', 8)}
+{candles_to_text(df_1h, '1H', 10)}
+{candles_to_text(df_15m, '15m', 12)}
+"""
+    return context, current_price
 
-        if bias == "LONG" and candle["close"] > candle["open"]:
-            for name, val in levels.items():
-                if val and candle["close"] > val > candle["open"]:
-                    broken_level = name
-                    broken_value = val
-                    break
+def ask_claude(symbol, context_text, current_price, bias):
+    prompt = f"""You are an expert price action trader. Analyze the following market data and determine if there is an A+ setup RIGHT NOW.
 
-        elif bias == "SHORT" and candle["close"] < candle["open"]:
-            for name, val in levels.items():
-                if val and candle["close"] < val < candle["open"]:
-                    broken_level = name
-                    broken_value = val
-                    break
+STRATEGY RULES:
+- Daily bias determines direction: {bias} only
+- Look for a strong displacement candle on 4H or 1H that broke a key level (PWH/PWL/PDH/PDL) with body > 60% of range
+- After the breakout, price must retest the broken level (now acting as support/resistance)
+- On 15m timeframe: look for a rejection candle at the retest zone (candle that enters the level and closes back above/below it, body > 50%)
+- Minimum RR: 2.0
+- SL: below/above the rejection candle wick
+- TP: next significant level
 
-        if broken_level is None:
-            continue
+MARKET DATA:
+{context_text}
 
-        fvg = has_fvg(df, i, bias)
+RESPOND ONLY IN THIS EXACT JSON FORMAT, nothing else:
+{{
+  "setup_found": true/false,
+  "grade": "A+" or "A" or "B" or "none",
+  "direction": "LONG" or "SHORT" or "none",
+  "entry": price or null,
+  "sl": price or null,
+  "tp": price or null,
+  "rr": number or null,
+  "broken_level": "PWH/PWL/PDH/PDL" or null,
+  "fvg_confluence": true/false,
+  "reasoning": "brief explanation in English, max 2 sentences"
+}}
 
-        return {
-            "symbol": symbol,
-            "bias": bias,
-            "tf": tf_high,
-            "broken_level": broken_level,
-            "broken_value": broken_value,
-            "breakout_candle_idx": i,
-            "fvg": fvg,
-            "df": df
-        }
+Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is NOT A+."""
 
-    return None
-
-def check_retest_and_rejection(setup):
-    symbol = setup["symbol"]
-    bias = setup["bias"]
-    tf_high = setup["tf"]
-    broken_value = setup["broken_value"]
-    fvg = setup["fvg"]
-
-    tf_low = "15m" if tf_high == "1h" else "1h"
-    df_low = get_klines(symbol, tf_low, limit=50)
-    if df_low is None or len(df_low) < 5:
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        data = response.json()
+        text = data["content"][0]["text"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(text)
+        return result
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
         return None
 
-    tolerance = broken_value * 0.002  # 0.2% tolerance
-
-    for i in range(len(df_low) - 5, len(df_low) - 1):
-        candle = df_low.iloc[i]
-        body = abs(candle["close"] - candle["open"])
-        candle_range = candle["high"] - candle["low"]
-        if candle_range == 0:
-            continue
-        body_ratio = body / candle_range
-        if body_ratio < 0.5:
-            continue
-
-        retested = False
-        rejected = False
-
-        if bias == "LONG":
-            retested = candle["low"] <= broken_value + tolerance
-            rejected = candle["close"] > broken_value
-
-        elif bias == "SHORT":
-            retested = candle["high"] >= broken_value - tolerance
-            rejected = candle["close"] < broken_value
-
-        if not (retested and rejected):
-            continue
-
-        entry = candle["close"]
-
-        if bias == "LONG":
-            sl = candle["low"] * 0.999
-            tp = entry + (entry - sl) * 2
-        else:
-            sl = candle["high"] * 1.001
-            tp = entry - (sl - entry) * 2
-
-        rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
-        if rr < 2.0:
-            continue
-
-        return {
-            "symbol": symbol,
-            "bias": bias,
-            "tf_context": tf_high,
-            "tf_entry": tf_low,
-            "broken_level": setup["broken_level"],
-            "broken_value": round(broken_value, 2),
-            "entry": round(entry, 2),
-            "sl": round(sl, 2),
-            "tp": round(tp, 2),
-            "rr": round(rr, 2),
-            "fvg": fvg
-        }
-
-    return None
-
-def format_alert(result):
-    emoji = "🟢" if result["bias"] == "LONG" else "🔴"
-    fvg_tag = "✅ FVG confluente" if result["fvg"] else "➖ No FVG"
+def format_alert(symbol, result, current_price):
+    emoji = "🟢" if result["direction"] == "LONG" else "🔴"
+    fvg_tag = "✅ FVG confluente" if result.get("fvg_confluence") else "➖ No FVG"
     msg = (
-        f"{emoji} <b>{result['symbol']} — {result['bias']}</b>\n"
-        f"📊 Contesto: {result['tf_context']} | Entry: {result['tf_entry']}\n"
-        f"🔑 Livello rotto: {result['broken_level']} @ {result['broken_value']}\n"
+        f"{emoji} <b>{symbol} — {result['direction']} [A+]</b>\n"
+        f"💰 Prezzo attuale: {current_price:.2f}\n"
+        f"🔑 Livello rotto: {result.get('broken_level', 'N/A')}\n"
         f"─────────────────\n"
         f"📥 Entry:  <b>{result['entry']}</b>\n"
         f"🛑 SL:     <b>{result['sl']}</b>\n"
@@ -219,42 +180,51 @@ def format_alert(result):
         f"📐 RR:     <b>1:{result['rr']}</b>\n"
         f"─────────────────\n"
         f"{fvg_tag}\n"
+        f"🧠 {result.get('reasoning', '')}\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
     )
     return msg
-
-alerted = set()
 
 def run_scan():
     logger.info(f"Scan avviato: {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
     for symbol in SYMBOLS:
         bias = get_daily_bias(symbol)
         if bias is None:
+            logger.info(f"{symbol}: bias non determinabile")
             continue
 
         pwh, pwl = get_weekly_levels(symbol)
         pdh, pdl = get_daily_levels(symbol)
 
-        for tf in ["1h", "4h"]:
-            setup = check_breakout(symbol, tf, bias, pwh, pwl, pdh, pdl)
-            if setup is None:
-                continue
+        result_ctx = build_market_context(symbol, bias, pwh, pwl, pdh, pdl)
+        if result_ctx is None:
+            continue
 
-            result = check_retest_and_rejection(setup)
-            if result is None:
-                continue
+        context_text, current_price = result_ctx
 
-            alert_key = f"{symbol}_{tf}_{result['broken_level']}_{result['entry']}"
-            if alert_key in alerted:
-                continue
+        claude_result = ask_claude(symbol, context_text, current_price, bias)
+        if claude_result is None:
+            continue
 
-            alerted.add(alert_key)
-            msg = format_alert(result)
-            send_telegram(msg)
-            logger.info(f"Alert inviato: {alert_key}")
+        logger.info(f"{symbol}: grade={claude_result.get('grade')} setup={claude_result.get('setup_found')}")
+
+        if not claude_result.get("setup_found"):
+            continue
+
+        if claude_result.get("rr") and float(claude_result["rr"]) < 2.0:
+            continue
+
+        alert_key = f"{symbol}_{claude_result.get('broken_level')}_{claude_result.get('entry')}"
+        if alert_key in alerted:
+            continue
+
+        alerted.add(alert_key)
+        msg = format_alert(symbol, claude_result, current_price)
+        send_telegram(msg)
+        logger.info(f"Alert A+ inviato: {alert_key}")
 
 def main():
-    send_telegram("🤖 <b>Bot avviato</b> — scansione BTC/ETH ogni 15 minuti.")
+    send_telegram("🤖 <b>Bot AI avviato</b> — Claude analizza BTC/ETH ogni 15 minuti. Solo setup A+ con RR ≥ 2.")
     run_scan()
     schedule.every(15).minutes.do(run_scan)
     while True:
