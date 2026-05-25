@@ -27,7 +27,7 @@ def send_telegram(message):
         logger.error(f"Telegram error: {e}")
 
 def get_klines(symbol, interval, limit=100):
-    url = "https://fapi.binance.com/fapi/v1/klines"
+    url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
         r = requests.get(url, params=params, timeout=10)
@@ -48,7 +48,7 @@ def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_daily_bias(symbol):
-    url = "https://fapi.binance.com/fapi/v1/klines"
+    url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": "1d", "limit": 200}
     try:
         r = requests.get(url, params=params, timeout=10)
