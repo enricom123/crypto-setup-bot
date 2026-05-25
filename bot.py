@@ -129,7 +129,6 @@ RECENT CANDLES:
 """
     return context, current_price
 
-
 def ask_claude(symbol, context_text, current_price, bias):
     prompt = f"""You are an expert price action trader. Analyze the following market data and determine if there is an A+ setup RIGHT NOW.
 
@@ -147,7 +146,7 @@ MARKET DATA:
 
 RESPOND ONLY IN THIS EXACT JSON FORMAT, nothing else:
 {{
-  "setup_found": true/false,
+  "setup_found": true,
   "grade": "A+" or "A" or "B" or "none",
   "direction": "LONG" or "SHORT" or "none",
   "entry": price or null,
@@ -155,7 +154,7 @@ RESPOND ONLY IN THIS EXACT JSON FORMAT, nothing else:
   "tp": price or null,
   "rr": number or null,
   "broken_level": "PWH/PWL/PDH/PDL" or null,
-  "fvg_confluence": true/false,
+  "fvg_confluence": true or false,
   "reasoning": "brief explanation in English, max 2 sentences"
 }}
 
@@ -177,6 +176,7 @@ Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is N
             timeout=30
         )
         data = response.json()
+        logger.info(f"Claude raw response: {str(data)[:300]}")
         text = data["content"][0]["text"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         result = json.loads(text)
@@ -184,6 +184,7 @@ Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is N
     except Exception as e:
         logger.error(f"Claude API error: {e}")
         return None
+
 
 def format_alert(symbol, result, current_price):
     emoji = "🟢" if result["direction"] == "LONG" else "🔴"
