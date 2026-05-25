@@ -48,10 +48,10 @@ def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_daily_bias(symbol):
-    df = get_klines(symbol, "1d", limit=60)
+    df = get_klines(symbol, "1d", limit=200)
     if df is None or len(df) < 10:
         return None
-    ema50 = get_ema(df["close"], 50)
+    ema50 = df["close"].ewm(span=50, adjust=False).mean()
     last_close = df["close"].iloc[-2]
     if last_close > ema50.iloc[-2]:
         return "LONG"
