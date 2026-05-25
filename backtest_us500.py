@@ -99,12 +99,9 @@ def get_klines_paginated(interval, pages=3):
             df["open_time"] = pd.to_datetime(df["open_time"])
             all_dfs.append(df)
             logger.info(f"Pagina {page+1}: {len(df)} candele, da {df['open_time'].min()} a {df['open_time'].max()}")
-
-            # Imposta end_date per pagina successiva
             oldest = df["open_time"].min()
             end_date = (oldest - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
             time.sleep(3)
-
         except Exception as e:
             logger.error(f"Pagination fetch error page {page}: {e}")
             break
@@ -173,7 +170,7 @@ def simulate_trade(entry, sl, tp_fixed, tp_liq, direction, future_candles):
             if row["low"] <= tp_fixed:
                 return "WIN_RR2", round(max_adverse, 2), candles_count
         max_adverse = max(max_adverse, max(adverse, 0))
-        if candles_count >= 192:
+        if candles_count >= 288:
             break
     return "OPEN", round(max_adverse, 2), candles_count
 
@@ -182,23 +179,35 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
     ema200 = get_ema(df_daily["close"], 200)
     ema50 = get_ema(df_daily["close"], 50)
 
+    stats = {"total": 0, "body_fail": 0, "no_level": 0, "bias_fail": 0, "no_retest": 0, "rr_fail": 0}
+
     for i in range(5, len(df_htf) - 1):
         if len(setups) >= target:
             break
 
         candle = df_htf.iloc[i]
         candle_time = candle["open_time"]
+        stats["total"] += 1
 
         body = abs(candle["close"] - candle["open"])
         rng = candle["high"] - candle["low"]
         if rng == 0 or body / rng < 0.6:
+            stats["body_fail"] += 1
             continue
 
         daily_mask = df_daily["open_time"] <= candle_time
         if daily_mask.sum() < 10:
             continue
         daily_idx = daily_mask.values.nonzero()[0][-1]
-        prev_daily = df_daily.iloc[daily_idx - 1]
+
+        prev_daily = None
+        for back in range(1, 6):
+            candidate = df_daily.iloc[daily_idx - back]
+            if candidate["high"] > 0 and candidate["low"] > 0:
+                prev_daily = candidate
+                break
+        if prev_daily is None:
+            continue
         pdh = float(prev_daily["high"])
         pdl = float(prev_daily["low"])
 
@@ -216,62 +225,77 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
         bias = "LONG" if df_daily["close"].iloc[daily_idx - 1] > ema50_val else "SHORT"
 
         levels = {"PWH": pwh, "PWL": pwl, "PDH": pdh, "PDL": pdl}
+
         direction = None
         broken_level = None
         broken_value = None
 
         if candle["close"] > candle["open"]:
-            for name, val in levels.items():
-                if val and candle["close"] > val > candle["open"]:
+            for name, val in sorted(levels.items(), key=lambda x: abs(x[1] - candle["open"])):
+                if val and candle["open"] < val < candle["close"]:
                     direction = "LONG"
                     broken_level = name
                     broken_value = val
                     break
         else:
-            for name, val in levels.items():
+            for name, val in sorted(levels.items(), key=lambda x: abs(x[1] - candle["open"])):
                 if val and candle["close"] < val < candle["open"]:
                     direction = "SHORT"
                     broken_level = name
                     broken_value = val
                     break
 
-        if direction is None or direction != bias:
+        if direction is None:
+            stats["no_level"] += 1
             continue
 
-        tolerance = broken_value * 0.002
-        fifteen_after = df_15m[df_15m["open_time"] > candle_time].head(192)
+        if direction != bias:
+            stats["bias_fail"] += 1
+            continue
 
+        tolerance = broken_value * 0.005
+        fifteen_after = df_15m[df_15m["open_time"] > candle_time].head(288)
+
+        found_retest = False
         for _, row_15m in fifteen_after.iterrows():
             r_body = abs(row_15m["close"] - row_15m["open"])
             r_rng = row_15m["high"] - row_15m["low"]
-            if r_rng == 0 or r_body / r_rng < 0.5:
+            if r_rng == 0 or r_body / r_rng < 0.4:
                 continue
 
             retested = False
             rejected = False
+
             if direction == "LONG":
                 retested = row_15m["low"] <= broken_value + tolerance
-                rejected = row_15m["close"] > broken_value
+                rejected = row_15m["close"] > broken_value - tolerance
             else:
                 retested = row_15m["high"] >= broken_value - tolerance
-                rejected = row_15m["close"] < broken_value
+                rejected = row_15m["close"] < broken_value + tolerance
 
             if not (retested and rejected):
                 continue
 
             entry = row_15m["close"]
             if direction == "LONG":
-                sl = row_15m["low"] * 0.9995
+                sl = min(row_15m["low"], broken_value) * 0.9995
                 tp_fixed = entry + (entry - sl) * 2
             else:
-                sl = row_15m["high"] * 1.0005
+                sl = max(row_15m["high"], broken_value) * 1.0005
                 tp_fixed = entry - (sl - entry) * 2
 
             risk = abs(entry - sl)
-            if risk == 0 or abs(tp_fixed - entry) / risk < 2.0:
+            if risk == 0:
                 continue
 
-            liq_name, liq_val = find_next_liquidity_level(entry, direction, levels)
+            rr_check = abs(tp_fixed - entry) / risk
+            if rr_check < 1.8:
+                stats["rr_fail"] += 1
+                continue
+
+            liq_name, liq_val = find_next_liquidity_level(
+                entry, direction, {"PWH": pwh, "PWL": pwl, "PDH": pdh, "PDL": pdl}
+            )
             tp_liq = liq_val
             rr_liq = round(abs(liq_val - entry) / risk, 2) if liq_val else None
 
@@ -287,7 +311,7 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
                         fvg = row_15m["high"] < c1["low"]
 
             signal_time = row_15m["open_time"]
-            future = df_15m[df_15m["open_time"] > signal_time].head(192)
+            future = df_15m[df_15m["open_time"] > signal_time].head(288)
             result, max_adverse, candles_count = simulate_trade(
                 entry, sl, tp_fixed, tp_liq, direction, future
             )
@@ -309,7 +333,7 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
                 "SL": round(sl, 2),
                 "TP RR2": round(tp_fixed, 2),
                 "TP Liquidity": round(tp_liq, 2) if tp_liq else "N/A",
-                "RR Fixed": 2.0,
+                "RR Fixed": round(rr_check, 2),
                 "RR Liquidity": rr_liq if rr_liq else "N/A",
                 "Liq Level Target": f"{liq_name} @ {round(liq_val,2)}" if liq_name else "N/A",
                 "Price vs EMA200": price_vs_ema200,
@@ -319,12 +343,17 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
                 "Max Adverse Excursion": max_adverse,
                 "Candles to Result": candles_count,
             })
+            found_retest = True
             break
 
+        if not found_retest:
+            stats["no_retest"] += 1
+
+    logger.info(f"{tf_label} stats: {stats}")
     return setups
 
 def run_backtest():
-    send_telegram("⏳ <b>Backtest US500 avviato</b> — scarico dati Twelve Data...")
+    send_telegram("⏳ <b>Backtest US500 avviato</b> — scarico dati Twelve Data SPX...")
     logger.info("Download dati storici...")
 
     df_daily = get_klines("1d", limit=500)
@@ -350,14 +379,15 @@ def run_backtest():
     all_setups.sort(key=lambda x: x["Date"])
 
     if not all_setups:
-        send_telegram("📊 Nessun setup trovato.")
+        send_telegram("📊 Nessun setup trovato. Controlla i log.")
         return
 
     df_results = pd.DataFrame(all_setups)
     total = len(df_results)
     wins = len(df_results[df_results["Result"].isin(["WIN_RR2","WIN_LIQ"])])
     losses = len(df_results[df_results["Result"] == "LOSS"])
-    win_rate = round(wins / total * 100, 1) if total > 0 else 0
+    opens = len(df_results[df_results["Result"] == "OPEN"])
+    win_rate = round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0
     wins_liq = len(df_results[df_results["Result"] == "WIN_LIQ"])
     wins_rr2 = len(df_results[df_results["Result"] == "WIN_RR2"])
 
@@ -365,7 +395,8 @@ def run_backtest():
         ((df_results["Direction"] == "LONG") & (df_results["Price vs EMA200"] == "Above")) |
         ((df_results["Direction"] == "SHORT") & (df_results["Price vs EMA200"] == "Below"))
     ]
-    wr_aligned = round(len(aligned[aligned["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(aligned) * 100, 1) if len(aligned) > 0 else 0
+    wr_aligned = round(len(aligned[aligned["Result"].isin(["WIN_RR2","WIN_LIQ"])]) /
+                       len(aligned[aligned["Result"].isin(["WIN_RR2","WIN_LIQ","LOSS"])]) * 100, 1) if len(aligned) > 0 else 0
 
     date_from = df_results["Date"].min()
     date_to = df_results["Date"].max()
@@ -374,7 +405,7 @@ def run_backtest():
         f"📊 <b>Backtest US500 completato</b>\n"
         f"📅 {date_from} → {date_to}\n"
         f"─────────────────\n"
-        f"Setup totali: <b>{total}</b>\n"
+        f"Setup totali: <b>{total}</b> (OPEN: {opens})\n"
         f"Win rate: <b>{win_rate}%</b>\n"
         f"WIN RR2: {wins_rr2} | WIN Liq: {wins_liq} | LOSS: {losses}\n"
         f"─────────────────\n"
@@ -384,29 +415,33 @@ def run_backtest():
     )
     for tf in ["1H","4H"]:
         tf_df = df_results[df_results["TF Context"] == tf]
-        if len(tf_df) > 0:
-            tf_wr = round(len(tf_df[tf_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(tf_df) * 100, 1)
+        tf_closed = tf_df[tf_df["Result"].isin(["WIN_RR2","WIN_LIQ","LOSS"])]
+        if len(tf_closed) > 0:
+            tf_wr = round(len(tf_df[tf_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(tf_closed) * 100, 1)
             summary += f"  {tf}: {len(tf_df)} setup, WR {tf_wr}%\n"
 
     summary += "\nPer giorno:\n"
     for day in ["Monday","Tuesday","Wednesday","Thursday","Friday"]:
         day_df = df_results[df_results["Day"] == day]
-        if len(day_df) > 0:
-            day_wr = round(len(day_df[day_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(day_df) * 100, 1)
+        day_closed = day_df[day_df["Result"].isin(["WIN_RR2","WIN_LIQ","LOSS"])]
+        if len(day_closed) > 0:
+            day_wr = round(len(day_df[day_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(day_closed) * 100, 1)
             summary += f"  {day[:3]}: {len(day_df)} setup, WR {day_wr}%\n"
 
     summary += "\nPer sessione:\n"
-    for sess in ["Open","Midday","Close"]:
+    for sess in ["Open","Midday","Close","Other"]:
         s_df = df_results[df_results["Session"] == sess]
-        if len(s_df) > 0:
-            s_wr = round(len(s_df[s_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(s_df) * 100, 1)
+        s_closed = s_df[s_df["Result"].isin(["WIN_RR2","WIN_LIQ","LOSS"])]
+        if len(s_closed) > 0:
+            s_wr = round(len(s_df[s_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(s_closed) * 100, 1)
             summary += f"  {sess}: {len(s_df)} setup, WR {s_wr}%\n"
 
     summary += "\nPer livello:\n"
     for lvl in ["PWH","PWL","PDH","PDL"]:
         l_df = df_results[df_results["Level Broken"] == lvl]
-        if len(l_df) > 0:
-            l_wr = round(len(l_df[l_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(l_df) * 100, 1)
+        l_closed = l_df[l_df["Result"].isin(["WIN_RR2","WIN_LIQ","LOSS"])]
+        if len(l_closed) > 0:
+            l_wr = round(len(l_df[l_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(l_closed) * 100, 1)
             summary += f"  {lvl}: {len(l_df)} setup, WR {l_wr}%\n"
 
     send_telegram(summary)
@@ -418,4 +453,3 @@ def run_backtest():
 
 if __name__ == "__main__":
     run_backtest()
-
