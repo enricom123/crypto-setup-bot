@@ -27,7 +27,6 @@ def send_telegram(message):
         logger.error(f"Telegram error: {e}")
 
 def get_klines(symbol, interval, limit=100):
-    # Mappa intervalli Bybit
     interval_map = {
         "1m": "1", "5m": "5", "15m": "15", "30m": "30",
         "1h": "60", "4h": "240", "1d": "D", "1w": "W"
@@ -41,8 +40,8 @@ def get_klines(symbol, interval, limit=100):
         "limit": limit
     }
     try:
-            r = requests.get(url, params=params, timeout=10)
-        logger.info(f"Bybit raw response: {r.text[:300]}")
+        r = requests.get(url, params=params, timeout=10)
+        logger.info(f"Bybit {symbol} {interval}: {r.text[:200]}")
         data = r.json()
         if data.get("retCode") != 0:
             logger.error(f"Bybit error: {data}")
