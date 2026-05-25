@@ -16,7 +16,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
 
-SYMBOL = "SPX"
+SYMBOL = "SPY"
 LABEL = "US500"
 
 alerted = set()
