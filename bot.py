@@ -90,11 +90,13 @@ def get_daily_levels(symbol):
     return float(prev["high"]), float(prev["low"])
 
 def build_market_context(symbol, bias, pwh, pwl, pdh, pdl):
-    df_1h = get_klines(symbol, "1h", limit=50)
     df_4h = get_klines(symbol, "4h", limit=50)
+    time.sleep(15)
+    df_1h = get_klines(symbol, "1h", limit=50)
+    time.sleep(15)
     df_15m = get_klines(symbol, "15m", limit=50)
 
-    if df_1h is None or df_4h is None or df_15m is None:
+    if df_4h is None or df_1h is None or df_15m is None:
         return None
 
     def candles_to_text(df, label, n=10):
@@ -126,6 +128,7 @@ RECENT CANDLES:
 {candles_to_text(df_15m, '15m', 12)}
 """
     return context, current_price
+
 
 def ask_claude(symbol, context_text, current_price, bias):
     prompt = f"""You are an expert price action trader. Analyze the following market data and determine if there is an A+ setup RIGHT NOW.
