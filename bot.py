@@ -41,7 +41,8 @@ def get_klines(symbol, interval, limit=100):
         "limit": limit
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=10)
+        logger.info(f"Bybit raw response: {r.text[:300]}")
         data = r.json()
         if data.get("retCode") != 0:
             logger.error(f"Bybit error: {data}")
