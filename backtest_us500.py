@@ -329,14 +329,16 @@ def run_backtest():
 
     df_daily = get_klines("1d", limit=500)
     df_weekly = get_klines("1w", limit=200)
-    df_1h = get_klines("1h", limit=5000)
-    df_15m = get_klines("15m", limit=5000)
+    df_1h = get_klines_paginated("1h", pages=2)
+    df_15m = get_klines_paginated("15m", pages=3)
 
     if any(df is None for df in [df_daily, df_weekly, df_1h, df_15m]):
         send_telegram("❌ Errore nel download dei dati.")
         return
 
     logger.info(f"Dati: daily={len(df_daily)}, weekly={len(df_weekly)}, 1h={len(df_1h)}, 15m={len(df_15m)}")
+    logger.info(f"1H: da {df_1h['open_time'].iloc[0]} a {df_1h['open_time'].iloc[-1]}")
+    logger.info(f"15m: da {df_15m['open_time'].iloc[0]} a {df_15m['open_time'].iloc[-1]}")
 
     setups_1h = detect_setups(df_1h, df_15m, df_daily, df_weekly, "1H", target=150)
     logger.info(f"Setup 1H: {len(setups_1h)}")
