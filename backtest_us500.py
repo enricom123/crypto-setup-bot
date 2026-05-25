@@ -13,7 +13,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
 
-SYMBOL = "SPX"
+SYMBOL = "SPY"
 TARGET_SETUPS = 200
 
 def send_telegram(message):
