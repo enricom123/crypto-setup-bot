@@ -5,14 +5,15 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 import logging
 import time
-import yfinance as yf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-SYMBOL = "SPY"
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
+
+SYMBOL = "SPX"
 TARGET_SETUPS = 200
 
 def send_telegram(message):
@@ -34,6 +35,36 @@ def send_telegram_file(filepath, caption):
     except Exception as e:
         logger.error(f"Telegram file error: {e}")
 
+def get_klines(interval, limit=500):
+    interval_map = {
+        "15m": "15min", "1h": "1h", "4h": "4h",
+        "1d": "1day", "1w": "1week"
+    }
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": SYMBOL,
+        "interval": interval_map.get(interval, interval),
+        "outputsize": limit,
+        "apikey": TWELVE_DATA_KEY,
+        "format": "JSON"
+    }
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if "values" not in data:
+            logger.error(f"Error {interval}: {data.get('message','unknown')}")
+            return None
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={"datetime": "open_time"})
+        for col in ["open", "high", "low", "close"]:
+            df[col] = df[col].astype(float)
+        df["open_time"] = pd.to_datetime(df["open_time"])
+        df = df.sort_values("open_time").reset_index(drop=True)
+        return df
+    except Exception as e:
+        logger.error(f"Fetch error {interval}: {e}")
+        return None
+
 def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -50,28 +81,6 @@ def get_session(dt):
 def get_day_of_week(dt):
     days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     return days[dt.weekday()]
-
-def download_data(period="5y"):
-    logger.info("Download dati Yahoo Finance...")
-    spy = yf.Ticker(SYMBOL)
-
-    df_15m = spy.history(period="60d", interval="15m")
-    df_1h = spy.history(period="2y", interval="1h")
-    df_4h = spy.history(period="5y", interval="1d")  # useremo daily come proxy 4H
-    df_daily = spy.history(period="5y", interval="1d")
-    df_weekly = spy.history(period="10y", interval="1wk")
-
-    for df in [df_15m, df_1h, df_4h, df_daily, df_weekly]:
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_convert("UTC").tz_localize(None)
-        df.rename(columns={
-            "Open": "open", "High": "high",
-            "Low": "low", "Close": "close"
-        }, inplace=True)
-        df["open_time"] = df.index
-
-    return df_15m, df_1h, df_daily, df_weekly
 
 def find_next_liquidity_level(entry, direction, levels_dict):
     candidates = []
@@ -112,7 +121,7 @@ def simulate_trade(entry, sl, tp_fixed, tp_liq, direction, future_candles):
             if row["low"] <= tp_fixed:
                 return "WIN_RR2", round(max_adverse, 2), candles_count
         max_adverse = max(max_adverse, max(adverse, 0))
-        if candles_count >= 192:  # max 2 giorni su 15m
+        if candles_count >= 192:
             break
     return "OPEN", round(max_adverse, 2), candles_count
 
@@ -120,47 +129,39 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
     setups = []
     ema200 = get_ema(df_daily["close"], 200)
     ema50 = get_ema(df_daily["close"], 50)
-    df_daily_reset = df_daily.reset_index(drop=True)
-    df_weekly_reset = df_weekly.reset_index(drop=True)
-    df_htf_reset = df_htf.reset_index(drop=True)
-    df_15m_reset = df_15m.reset_index(drop=True)
 
-    for i in range(5, len(df_htf_reset) - 1):
+    for i in range(5, len(df_htf) - 1):
         if len(setups) >= target:
             break
 
-        candle = df_htf_reset.iloc[i]
+        candle = df_htf.iloc[i]
         candle_time = candle["open_time"]
 
         body = abs(candle["close"] - candle["open"])
         rng = candle["high"] - candle["low"]
-        if rng == 0:
-            continue
-        if body / rng < 0.6:
+        if rng == 0 or body / rng < 0.6:
             continue
 
-        # Daily context
-        daily_mask = df_daily_reset["open_time"] <= candle_time
+        daily_mask = df_daily["open_time"] <= candle_time
         if daily_mask.sum() < 10:
             continue
         daily_idx = daily_mask.values.nonzero()[0][-1]
-        prev_daily = df_daily_reset.iloc[daily_idx - 1]
+        prev_daily = df_daily.iloc[daily_idx - 1]
         pdh = float(prev_daily["high"])
         pdl = float(prev_daily["low"])
 
-        # Weekly context
-        weekly_mask = df_weekly_reset["open_time"] <= candle_time
+        weekly_mask = df_weekly["open_time"] <= candle_time
         if weekly_mask.sum() < 2:
             continue
         weekly_idx = weekly_mask.values.nonzero()[0][-1]
-        prev_weekly = df_weekly_reset.iloc[weekly_idx - 1]
+        prev_weekly = df_weekly.iloc[weekly_idx - 1]
         pwh = float(prev_weekly["high"])
         pwl = float(prev_weekly["low"])
 
         ema200_val = ema200.iloc[daily_idx]
         ema50_val = ema50.iloc[daily_idx]
         price_vs_ema200 = "Above" if candle["close"] > ema200_val else "Below"
-        bias = "LONG" if df_daily_reset["close"].iloc[daily_idx - 1] > ema50_val else "SHORT"
+        bias = "LONG" if df_daily["close"].iloc[daily_idx - 1] > ema50_val else "SHORT"
 
         levels = {"PWH": pwh, "PWL": pwl, "PDH": pdh, "PDL": pdl}
         direction = None
@@ -186,14 +187,12 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
             continue
 
         tolerance = broken_value * 0.002
-        fifteen_after = df_15m_reset[df_15m_reset["open_time"] > candle_time].head(192)
+        fifteen_after = df_15m[df_15m["open_time"] > candle_time].head(192)
 
         for _, row_15m in fifteen_after.iterrows():
             r_body = abs(row_15m["close"] - row_15m["open"])
             r_rng = row_15m["high"] - row_15m["low"]
-            if r_rng == 0:
-                continue
-            if r_body / r_rng < 0.5:
+            if r_rng == 0 or r_body / r_rng < 0.5:
                 continue
 
             retested = False
@@ -224,21 +223,19 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
             tp_liq = liq_val
             rr_liq = round(abs(liq_val - entry) / risk, 2) if liq_val else None
 
-            # FVG check su 15m
             fvg = False
-            fifteen_idx = df_15m_reset.index[df_15m_reset["open_time"] == row_15m["open_time"]]
-            if len(fifteen_idx) > 0:
-                idx = fifteen_idx[0]
+            idx_15m = df_15m.index[df_15m["open_time"] == row_15m["open_time"]]
+            if len(idx_15m) > 0:
+                idx = idx_15m[0]
                 if idx >= 2:
-                    c1 = df_15m_reset.iloc[idx - 2]
-                    c3 = row_15m
+                    c1 = df_15m.iloc[idx - 2]
                     if direction == "LONG":
-                        fvg = c3["low"] > c1["high"]
+                        fvg = row_15m["low"] > c1["high"]
                     else:
-                        fvg = c3["high"] < c1["low"]
+                        fvg = row_15m["high"] < c1["low"]
 
             signal_time = row_15m["open_time"]
-            future = df_15m_reset[df_15m_reset["open_time"] > signal_time].head(192)
+            future = df_15m[df_15m["open_time"] > signal_time].head(192)
             result, max_adverse, candles_count = simulate_trade(
                 entry, sl, tp_fixed, tp_liq, direction, future
             )
@@ -275,37 +272,36 @@ def detect_setups(df_htf, df_15m, df_daily, df_weekly, tf_label, target=200):
     return setups
 
 def run_backtest():
-    send_telegram("⏳ <b>Backtest US500 avviato</b> — elaborazione fino a 200 setup su dati Yahoo Finance...")
+    send_telegram("⏳ <b>Backtest US500 avviato</b> — scarico dati Twelve Data...")
+    logger.info("Download dati storici...")
 
-    df_15m, df_1h, df_daily, df_weekly = download_data()
-    
-    logger.info(f"15m shape: {df_15m.shape if df_15m is not None else 'None'}")
-    logger.info(f"1H shape: {df_1h.shape if df_1h is not None else 'None'}")
-    logger.info(f"Daily shape: {df_daily.shape if df_daily is not None else 'None'}")
-    logger.info(f"Weekly shape: {df_weekly.shape if df_weekly is not None else 'None'}")
-    
-    if df_15m is not None and len(df_15m) > 0:
-        logger.info(f"15m primo: {df_15m['open_time'].iloc[0]} ultimo: {df_15m['open_time'].iloc[-1]}")
-    if df_1h is not None and len(df_1h) > 0:
-        logger.info(f"1H primo: {df_1h['open_time'].iloc[0]} ultimo: {df_1h['open_time'].iloc[-1]}")
+    df_daily = get_klines("1d", limit=500)
+    df_weekly = get_klines("1w", limit=200)
+    df_1h = get_klines("1h", limit=5000)
+    df_15m = get_klines("15m", limit=5000)
+
+    if any(df is None for df in [df_daily, df_weekly, df_1h, df_15m]):
+        send_telegram("❌ Errore nel download dei dati.")
+        return
+
+    logger.info(f"Dati: daily={len(df_daily)}, weekly={len(df_weekly)}, 1h={len(df_1h)}, 15m={len(df_15m)}")
 
     setups_1h = detect_setups(df_1h, df_15m, df_daily, df_weekly, "1H", target=150)
-    logger.info(f"Setup 1H trovati: {len(setups_1h)}")
+    logger.info(f"Setup 1H: {len(setups_1h)}")
 
     setups_4h = detect_setups(df_daily, df_15m, df_daily, df_weekly, "4H", target=50)
-    logger.info(f"Setup 4H trovati: {len(setups_4h)}")
+    logger.info(f"Setup 4H: {len(setups_4h)}")
 
     all_setups = setups_1h + setups_4h
-    
-    send_telegram(f"Debug: 15m={len(df_15m) if df_15m is not None else 0} righe, 1H={len(df_1h) if df_1h is not None else 0} righe, setup={len(all_setups)}")
-    
+    all_setups.sort(key=lambda x: x["Date"])
+
     if not all_setups:
-        send_telegram("📊 Nessun setup trovato. Controlla i parametri.")
+        send_telegram("📊 Nessun setup trovato.")
         return
 
     df_results = pd.DataFrame(all_setups)
     total = len(df_results)
-    wins = len(df_results[df_results["Result"].isin(["WIN_RR2", "WIN_LIQ"])])
+    wins = len(df_results[df_results["Result"].isin(["WIN_RR2","WIN_LIQ"])])
     losses = len(df_results[df_results["Result"] == "LOSS"])
     win_rate = round(wins / total * 100, 1) if total > 0 else 0
     wins_liq = len(df_results[df_results["Result"] == "WIN_LIQ"])
@@ -317,24 +313,22 @@ def run_backtest():
     ]
     wr_aligned = round(len(aligned[aligned["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(aligned) * 100, 1) if len(aligned) > 0 else 0
 
-    # Date range
     date_from = df_results["Date"].min()
     date_to = df_results["Date"].max()
 
     summary = (
         f"📊 <b>Backtest US500 completato</b>\n"
-        f"📅 Periodo: {date_from} → {date_to}\n"
+        f"📅 {date_from} → {date_to}\n"
         f"─────────────────\n"
-        f"Setup A+ totali: <b>{total}</b>\n"
+        f"Setup totali: <b>{total}</b>\n"
         f"Win rate: <b>{win_rate}%</b>\n"
         f"WIN RR2: {wins_rr2} | WIN Liq: {wins_liq} | LOSS: {losses}\n"
         f"─────────────────\n"
-        f"🎯 WR con EMA200 allineata: <b>{wr_aligned}%</b>\n"
+        f"🎯 WR EMA200 allineata: <b>{wr_aligned}%</b>\n"
         f"─────────────────\n"
         f"Per TF:\n"
     )
-
-    for tf in ["1H", "4H"]:
+    for tf in ["1H","4H"]:
         tf_df = df_results[df_results["TF Context"] == tf]
         if len(tf_df) > 0:
             tf_wr = round(len(tf_df[tf_df["Result"].isin(["WIN_RR2","WIN_LIQ"])]) / len(tf_df) * 100, 1)
@@ -363,11 +357,10 @@ def run_backtest():
 
     send_telegram(summary)
 
-    # Invia CSV su Telegram
     csv_path = "/tmp/backtest_us500.csv"
     df_results.to_csv(csv_path, index=False)
-    send_telegram_file(csv_path, f"📎 Backtest US500 — {total} setup completi")
-    logger.info("Backtest completato e CSV inviato.")
+    send_telegram_file(csv_path, f"📎 Backtest US500 — {total} setup")
+    logger.info("Completato.")
 
 if __name__ == "__main__":
     run_backtest()
