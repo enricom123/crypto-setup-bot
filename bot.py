@@ -48,16 +48,31 @@ def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_daily_bias(symbol):
-    df = get_klines(symbol, "1d", limit=200)
-    if df is None or len(df) < 10:
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": "1d", "limit": 200}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        logger.info(f"{symbol} daily response: {str(data)[:200]}")
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_vol","trades","taker_base","taker_quote","ignore"
+        ])
+        for col in ["open","high","low","close"]:
+            df[col] = df[col].astype(float)
+        if len(df) < 10:
+            logger.info(f"{symbol}: solo {len(df)} candele daily")
+            return None
+        ema50 = df["close"].ewm(span=50, adjust=False).mean()
+        last_close = df["close"].iloc[-2]
+        if last_close > ema50.iloc[-2]:
+            return "LONG"
+        elif last_close < ema50.iloc[-2]:
+            return "SHORT"
         return None
-    ema50 = df["close"].ewm(span=50, adjust=False).mean()
-    last_close = df["close"].iloc[-2]
-    if last_close > ema50.iloc[-2]:
-        return "LONG"
-    elif last_close < ema50.iloc[-2]:
-        return "SHORT"
-    return None
+    except Exception as e:
+        logger.error(f"{symbol} daily bias error: {e}")
+        return None
 
 def get_weekly_levels(symbol):
     df = get_klines(symbol, "1w", limit=10)
