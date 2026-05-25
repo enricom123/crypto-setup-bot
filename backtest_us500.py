@@ -15,7 +15,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-SYMBOL = "SPX"
+SYMBOL = "SPY"
 LOOKBACK_DAYS = 180  # 6 mesi
 
 def send_telegram(message):
