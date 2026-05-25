@@ -27,43 +27,43 @@ def send_telegram(message):
         logger.error(f"Telegram error: {e}")
 
 def get_klines(symbol, interval, limit=100):
+    ticker_map = {"BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD"}
     interval_map = {
-        "1m": "1", "5m": "5", "15m": "15", "30m": "30",
-        "1h": "60", "4h": "240", "1d": "D", "1w": "W"
+        "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day", "1w": "1week"
     }
-    bybit_interval = interval_map.get(interval, interval)
-    url = "https://api.bybit.com/v5/market/kline"
+    twelve_symbol = ticker_map.get(symbol, symbol)
+    twelve_interval = interval_map.get(interval, interval)
+    TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
+    url = "https://api.twelvedata.com/time_series"
     params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": bybit_interval,
-        "limit": limit
+        "symbol": twelve_symbol,
+        "interval": twelve_interval,
+        "outputsize": limit,
+        "apikey": TWELVE_DATA_KEY,
+        "format": "JSON"
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
-        logger.info(f"Bybit {symbol} {interval}: {r.text[:200]}")
+        r = requests.get(url, params=params, timeout=15)
         data = r.json()
-        if data.get("retCode") != 0:
-            logger.error(f"Bybit error: {data}")
+        if "values" not in data:
+            logger.error(f"Twelve Data error {symbol} {interval}: {data}")
             return None
-        rows = data["result"]["list"]
-        df = pd.DataFrame(rows, columns=[
-            "open_time","open","high","low","close","volume","turnover"
-        ])
-        for col in ["open","high","low","close","volume"]:
+        df = pd.DataFrame(data["values"])
+        df = df.rename(columns={"datetime": "open_time"})
+        for col in ["open", "high", "low", "close"]:
             df[col] = df[col].astype(float)
-        df["open_time"] = pd.to_datetime(df["open_time"].astype(float), unit="ms")
+        df["open_time"] = pd.to_datetime(df["open_time"])
         df = df.sort_values("open_time").reset_index(drop=True)
         return df
     except Exception as e:
-        logger.error(f"Bybit error {symbol} {interval}: {e}")
+        logger.error(f"Twelve Data error {symbol} {interval}: {e}")
         return None
 
 def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
 def get_daily_bias(symbol):
-    df = get_klines(symbol, "1d", limit=200)
+    df = get_klines(symbol, "1d", limit=60)
     if df is None or len(df) < 10:
         logger.info(f"{symbol}: bias non determinabile")
         return None
