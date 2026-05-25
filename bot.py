@@ -169,7 +169,7 @@ Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is N
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": ""model": "claude-sonnet-4-5-20251001",
                 "max_tokens": 500,
                 "messages": [{"role": "user", "content": prompt}]
             },
