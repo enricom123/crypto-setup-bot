@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
+
+SYMBOLS = [
+    {"symbol": "BTCUSDT", "twelve": "BTC/USD", "label": "BTC"},
+    {"symbol": "ETHUSDT", "twelve": "ETH/USD", "label": "ETH"},
+]
 
 alerted = set()
 
@@ -26,14 +31,12 @@ def send_telegram(message):
     except Exception as e:
         logger.error(f"Telegram error: {e}")
 
-def get_klines(symbol, interval, limit=100):
-    ticker_map = {"BTCUSDT": "BTC/USD", "ETHUSDT": "ETH/USD"}
+def get_klines(twelve_symbol, interval, limit=50):
     interval_map = {
-        "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1day", "1w": "1week"
+        "15m": "15min", "1h": "1h", "4h": "4h",
+        "1d": "1day", "1w": "1week"
     }
-    twelve_symbol = ticker_map.get(symbol, symbol)
     twelve_interval = interval_map.get(interval, interval)
-    TWELVE_DATA_KEY = os.environ.get("TWELVE_DATA_KEY")
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": twelve_symbol,
@@ -46,7 +49,7 @@ def get_klines(symbol, interval, limit=100):
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
         if "values" not in data:
-            logger.error(f"Twelve Data error {symbol} {interval}: {data}")
+            logger.error(f"Twelve Data error {twelve_symbol} {interval}: {data.get('message','unknown')}")
             return None
         df = pd.DataFrame(data["values"])
         df = df.rename(columns={"datetime": "open_time"})
@@ -56,18 +59,18 @@ def get_klines(symbol, interval, limit=100):
         df = df.sort_values("open_time").reset_index(drop=True)
         return df
     except Exception as e:
-        logger.error(f"Twelve Data error {symbol} {interval}: {e}")
+        logger.error(f"Twelve Data fetch error {twelve_symbol} {interval}: {e}")
         return None
 
 def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def get_daily_bias(symbol):
-    df = get_klines(symbol, "1d", limit=60)
+def get_daily_bias(twelve_symbol):
+    df = get_klines(twelve_symbol, "1d", limit=60)
+    time.sleep(8)
     if df is None or len(df) < 10:
-        logger.info(f"{symbol}: bias non determinabile")
         return None
-    ema50 = df["close"].ewm(span=50, adjust=False).mean()
+    ema50 = get_ema(df["close"], 50)
     last_close = df["close"].iloc[-2]
     if last_close > ema50.iloc[-2]:
         return "LONG"
@@ -75,26 +78,29 @@ def get_daily_bias(symbol):
         return "SHORT"
     return None
 
-def get_weekly_levels(symbol):
-    df = get_klines(symbol, "1w", limit=10)
+def get_weekly_levels(twelve_symbol):
+    df = get_klines(twelve_symbol, "1w", limit=10)
+    time.sleep(8)
     if df is None or len(df) < 2:
         return None, None
     prev = df.iloc[-2]
     return float(prev["high"]), float(prev["low"])
 
-def get_daily_levels(symbol):
-    df = get_klines(symbol, "1d", limit=10)
+def get_daily_levels(twelve_symbol):
+    df = get_klines(twelve_symbol, "1d", limit=10)
+    time.sleep(8)
     if df is None or len(df) < 2:
         return None, None
     prev = df.iloc[-2]
     return float(prev["high"]), float(prev["low"])
 
-def build_market_context(symbol, bias, pwh, pwl, pdh, pdl):
-    df_4h = get_klines(symbol, "4h", limit=50)
-    time.sleep(15)
-    df_1h = get_klines(symbol, "1h", limit=50)
-    time.sleep(15)
-    df_15m = get_klines(symbol, "15m", limit=50)
+def build_market_context(twelve_symbol, bias, pwh, pwl, pdh, pdl):
+    df_4h = get_klines(twelve_symbol, "4h", limit=50)
+    time.sleep(8)
+    df_1h = get_klines(twelve_symbol, "1h", limit=50)
+    time.sleep(8)
+    df_15m = get_klines(twelve_symbol, "15m", limit=50)
+    time.sleep(8)
 
     if df_4h is None or df_1h is None or df_15m is None:
         return None
@@ -108,57 +114,46 @@ def build_market_context(symbol, bias, pwh, pwl, pdh, pdl):
             direction = "BULL" if row["close"] > row["open"] else "BEAR"
             rows.append(
                 f"{row['open_time'].strftime('%m-%d %H:%M')} | {direction} | "
-                f"O:{row['open']:.1f} H:{row['high']:.1f} L:{row['low']:.1f} C:{row['close']:.1f} | "
-                f"Body:{body_pct}%"
+                f"O:{row['open']:.2f} H:{row['high']:.2f} "
+                f"L:{row['low']:.2f} C:{row['close']:.2f} | Body:{body_pct}%"
             )
         return f"\n[{label}]\n" + "\n".join(rows)
 
     current_price = df_15m["close"].iloc[-1]
-
-    context = f"""SYMBOL: {symbol}
+    context = f"""SYMBOL: {twelve_symbol}
 CURRENT PRICE: {current_price:.2f}
 DAILY BIAS: {bias}
 KEY LEVELS:
   PWH: {pwh:.2f} | PWL: {pwl:.2f}
   PDH: {pdh:.2f} | PDL: {pdl:.2f}
-
-RECENT CANDLES:
 {candles_to_text(df_4h, '4H', 8)}
 {candles_to_text(df_1h, '1H', 10)}
-{candles_to_text(df_15m, '15m', 12)}
-"""
+{candles_to_text(df_15m, '15m', 12)}"""
     return context, current_price
 
-def ask_claude(symbol, context_text, current_price, bias):
-    prompt = f"""You are an expert price action trader. Analyze the following market data and determine if there is an A+ setup RIGHT NOW.
+def ask_claude(symbol_label, context_text, bias):
+    prompt = f"""You are an expert price action trader. Analyze this market data for {symbol_label} and determine if there is an A+ setup RIGHT NOW.
 
 STRATEGY RULES:
-- Daily bias determines direction: {bias} only
-- Look for a strong displacement candle on 4H or 1H that broke a key level (PWH/PWL/PDH/PDL) with body > 60% of range
-- After the breakout, price must retest the broken level (now acting as support/resistance)
-- On 15m timeframe: look for a rejection candle at the retest zone (candle that enters the level and closes back above/below it, body > 50%)
-- Minimum RR: 2.0
-- SL: below/above the rejection candle wick
-- TP: next significant level
+- Bias: {bias} only — no trades against the trend
+- Step 1: Find a displacement candle on 4H or 1H breaking PWH/PWL/PDH/PDL with body > 60% of range
+- Step 2: Price must retest that broken level (now S/R flip)
+- Step 3: On 15m, find a rejection candle at the retest (enters level, closes back on correct side, body > 50%)
+- Minimum RR: 2.0 — if RR < 2.0, setup_found must be false
+- SL: beyond rejection candle wick
+- TP: next significant HTF level
+- FVG confluence: bonus if a Fair Value Gap aligns with the retest zone
+
+Be STRICT. Only A+ if ALL conditions are met perfectly. If any doubt, return setup_found: false.
 
 MARKET DATA:
 {context_text}
 
-RESPOND ONLY IN THIS EXACT JSON FORMAT, nothing else:
-{{
-  "setup_found": true,
-  "grade": "A+" or "A" or "B" or "none",
-  "direction": "LONG" or "SHORT" or "none",
-  "entry": price or null,
-  "sl": price or null,
-  "tp": price or null,
-  "rr": number or null,
-  "broken_level": "PWH/PWL/PDH/PDL" or null,
-  "fvg_confluence": true or false,
-  "reasoning": "brief explanation in English, max 2 sentences"
-}}
+RESPOND ONLY WITH THIS JSON, no other text:
+{{"setup_found": false, "grade": "none", "direction": "none", "entry": null, "sl": null, "tp": null, "rr": null, "broken_level": null, "fvg_confluence": false, "reasoning": "no setup"}}
 
-Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is NOT A+."""
+OR if A+ found:
+{{"setup_found": true, "grade": "A+", "direction": "LONG or SHORT", "entry": 00000.00, "sl": 00000.00, "tp": 00000.00, "rr": 0.0, "broken_level": "PWH or PWL or PDH or PDL", "fvg_confluence": true or false, "reasoning": "max 2 sentences"}}"""
 
     try:
         response = requests.post(
@@ -169,14 +164,16 @@ Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is N
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-5-20251001",
-                "max_tokens": 500,
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 400,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=30
         )
         data = response.json()
-        logger.info(f"Claude raw response: {str(data)[:300]}")
+        if "content" not in data:
+            logger.error(f"Claude error: {data}")
+            return None
         text = data["content"][0]["text"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         result = json.loads(text)
@@ -185,63 +182,67 @@ Only report setup_found: true if grade is A+. Be strict. If in doubt, grade is N
         logger.error(f"Claude API error: {e}")
         return None
 
-
-def format_alert(symbol, result, current_price):
+def format_alert(label, result, current_price):
     emoji = "🟢" if result["direction"] == "LONG" else "🔴"
     fvg_tag = "✅ FVG confluente" if result.get("fvg_confluence") else "➖ No FVG"
-    msg = (
-        f"{emoji} <b>{symbol} — {result['direction']} [A+]</b>\n"
-        f"💰 Prezzo attuale: {current_price:.2f}\n"
-        f"🔑 Livello rotto: {result.get('broken_level', 'N/A')}\n"
+    return (
+        f"{emoji} <b>{label} — {result['direction']} [A+]</b>\n"
+        f"💰 Prezzo: {current_price:.2f}\n"
+        f"🔑 Livello: {result.get('broken_level', 'N/A')}\n"
         f"─────────────────\n"
-        f"📥 Entry:  <b>{result['entry']}</b>\n"
-        f"🛑 SL:     <b>{result['sl']}</b>\n"
-        f"🎯 TP:     <b>{result['tp']}</b>\n"
-        f"📐 RR:     <b>1:{result['rr']}</b>\n"
+        f"📥 Entry: <b>{result['entry']}</b>\n"
+        f"🛑 SL:    <b>{result['sl']}</b>\n"
+        f"🎯 TP:    <b>{result['tp']}</b>\n"
+        f"📐 RR:    <b>1:{result['rr']}</b>\n"
         f"─────────────────\n"
         f"{fvg_tag}\n"
         f"🧠 {result.get('reasoning', '')}\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
     )
-    return msg
+
+def scan_symbol(sym):
+    twelve_symbol = sym["twelve"]
+    label = sym["label"]
+
+    bias = get_daily_bias(twelve_symbol)
+    if bias is None:
+        logger.info(f"{label}: bias non determinabile")
+        return
+
+    pwh, pwl = get_weekly_levels(twelve_symbol)
+    pdh, pdl = get_daily_levels(twelve_symbol)
+
+    result_ctx = build_market_context(twelve_symbol, bias, pwh, pwl, pdh, pdl)
+    if result_ctx is None:
+        logger.info(f"{label}: dati insufficienti")
+        return
+
+    context_text, current_price = result_ctx
+    claude_result = ask_claude(label, context_text, bias)
+    if claude_result is None:
+        return
+
+    logger.info(f"{label}: grade={claude_result.get('grade')} setup={claude_result.get('setup_found')} rr={claude_result.get('rr')}")
+
+    if not claude_result.get("setup_found"):
+        return
+    if not claude_result.get("rr") or float(claude_result["rr"]) < 2.0:
+        return
+
+    alert_key = f"{label}_{claude_result.get('broken_level')}_{claude_result.get('entry')}"
+    if alert_key in alerted:
+        return
+
+    alerted.add(alert_key)
+    msg = format_alert(label, claude_result, current_price)
+    send_telegram(msg)
+    logger.info(f"Alert A+ inviato: {alert_key}")
 
 def run_scan():
     logger.info(f"Scan avviato: {datetime.now(timezone.utc).strftime('%H:%M:%S')}")
-    for symbol in SYMBOLS:
-        bias = get_daily_bias(symbol)
-        if bias is None:
-            logger.info(f"{symbol}: bias non determinabile")
-            continue
-
-        pwh, pwl = get_weekly_levels(symbol)
-        pdh, pdl = get_daily_levels(symbol)
-
-        result_ctx = build_market_context(symbol, bias, pwh, pwl, pdh, pdl)
-        if result_ctx is None:
-            continue
-
-        context_text, current_price = result_ctx
-
-        claude_result = ask_claude(symbol, context_text, current_price, bias)
-        if claude_result is None:
-            continue
-
-        logger.info(f"{symbol}: grade={claude_result.get('grade')} setup={claude_result.get('setup_found')}")
-
-        if not claude_result.get("setup_found"):
-            continue
-
-        if claude_result.get("rr") and float(claude_result["rr"]) < 2.0:
-            continue
-
-        alert_key = f"{symbol}_{claude_result.get('broken_level')}_{claude_result.get('entry')}"
-        if alert_key in alerted:
-            continue
-
-        alerted.add(alert_key)
-        msg = format_alert(symbol, claude_result, current_price)
-        send_telegram(msg)
-        logger.info(f"Alert A+ inviato: {alert_key}")
+    for sym in SYMBOLS:
+        scan_symbol(sym)
+        time.sleep(10)
 
 def main():
     send_telegram("🤖 <b>Bot AI avviato</b> — Claude analizza BTC/ETH ogni 15 minuti. Solo setup A+ con RR ≥ 2.")
