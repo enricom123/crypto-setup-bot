@@ -278,7 +278,16 @@ def run_backtest():
     send_telegram("⏳ <b>Backtest US500 avviato</b> — elaborazione fino a 200 setup su dati Yahoo Finance...")
 
     df_15m, df_1h, df_daily, df_weekly = download_data()
-    logger.info(f"Dati scaricati: 15m={len(df_15m)}, 1H={len(df_1h)}, Daily={len(df_daily)}")
+    
+    logger.info(f"15m shape: {df_15m.shape if df_15m is not None else 'None'}")
+    logger.info(f"1H shape: {df_1h.shape if df_1h is not None else 'None'}")
+    logger.info(f"Daily shape: {df_daily.shape if df_daily is not None else 'None'}")
+    logger.info(f"Weekly shape: {df_weekly.shape if df_weekly is not None else 'None'}")
+    
+    if df_15m is not None and len(df_15m) > 0:
+        logger.info(f"15m primo: {df_15m['open_time'].iloc[0]} ultimo: {df_15m['open_time'].iloc[-1]}")
+    if df_1h is not None and len(df_1h) > 0:
+        logger.info(f"1H primo: {df_1h['open_time'].iloc[0]} ultimo: {df_1h['open_time'].iloc[-1]}")
 
     setups_1h = detect_setups(df_1h, df_15m, df_daily, df_weekly, "1H", target=150)
     logger.info(f"Setup 1H trovati: {len(setups_1h)}")
@@ -287,8 +296,9 @@ def run_backtest():
     logger.info(f"Setup 4H trovati: {len(setups_4h)}")
 
     all_setups = setups_1h + setups_4h
-    all_setups.sort(key=lambda x: x["Date"])
-
+    
+    send_telegram(f"Debug: 15m={len(df_15m) if df_15m is not None else 0} righe, 1H={len(df_1h) if df_1h is not None else 0} righe, setup={len(all_setups)}")
+    
     if not all_setups:
         send_telegram("📊 Nessun setup trovato. Controlla i parametri.")
         return
