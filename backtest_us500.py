@@ -65,6 +65,58 @@ def get_klines(interval, limit=500):
         logger.error(f"Fetch error {interval}: {e}")
         return None
 
+def get_klines_paginated(interval, pages=3):
+    interval_map = {
+        "15m": "15min", "1h": "1h", "4h": "4h",
+        "1d": "1day", "1w": "1week"
+    }
+    all_dfs = []
+    end_date = None
+
+    for page in range(pages):
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": SYMBOL,
+            "interval": interval_map.get(interval, interval),
+            "outputsize": 5000,
+            "apikey": TWELVE_DATA_KEY,
+            "format": "JSON",
+            "order": "DESC"
+        }
+        if end_date:
+            params["end_date"] = end_date
+
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            data = r.json()
+            if "values" not in data:
+                logger.error(f"Pagination error page {page}: {data.get('message','unknown')}")
+                break
+            df = pd.DataFrame(data["values"])
+            df = df.rename(columns={"datetime": "open_time"})
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            df["open_time"] = pd.to_datetime(df["open_time"])
+            all_dfs.append(df)
+            logger.info(f"Pagina {page+1}: {len(df)} candele, da {df['open_time'].min()} a {df['open_time'].max()}")
+
+            # Imposta end_date per pagina successiva
+            oldest = df["open_time"].min()
+            end_date = (oldest - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+            time.sleep(3)
+
+        except Exception as e:
+            logger.error(f"Pagination fetch error page {page}: {e}")
+            break
+
+    if not all_dfs:
+        return None
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["open_time"])
+    combined = combined.sort_values("open_time").reset_index(drop=True)
+    return combined
+
 def get_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
